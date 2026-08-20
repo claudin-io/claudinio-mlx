@@ -135,17 +135,23 @@ final class ModelHost: Sendable {
 
         var completionTokens = 0
         var finishReason = "stop"
+        // Kept so a call the inferred parser missed can still be recovered —
+        // see `recoverToolCalls`.
+        var emittedToolCalls = 0
+        var transcript = ""
 
         let stream = try await container.generate(input: input, parameters: parameters)
         for await event in stream {
             switch event {
             case .chunk(let text):
+                transcript += text
                 await emit(.chunk(text))
             case .toolCall(let call):
                 // A call wins over the stop reason: the turn ended in a tool
                 // call even though generation itself stopped normally, and the
                 // agent loop keys off exactly this field.
                 finishReason = "tool_calls"
+                emittedToolCalls += 1
                 await emit(
                     .toolCall(
                         name: call.function.name,
@@ -170,11 +176,62 @@ final class ModelHost: Sendable {
             }
         }
 
+        // A tool call the model clearly made, that the inferred parser did not
+        // recognise, is worse than no tool calling at all: the agent waits for
+        // a call that arrived as prose. Upstream picks the parser by scanning
+        // the chat template, and a template that merely *mentions* another
+        // dialect's marker wins the wrong match — Qwen3-VL's template names
+        // `[TOOL_CALLS]` 44 times while the model emits `<tool_call>`.
+        if emittedToolCalls == 0, !transcript.isEmpty {
+            for call in Self.recoverToolCalls(from: transcript) {
+                finishReason = "tool_calls"
+                await emit(.toolCall(name: call.name, arguments: call.arguments))
+            }
+        }
+
         await emit(
             .done(
                 promptTokens: promptTokenCount,
                 completionTokens: completionTokens,
                 finishReason: finishReason))
+    }
+
+    /// Pull `<tool_call>{"name":…,"arguments":{…}}</tool_call>` blocks out of
+    /// generated text.
+    ///
+    /// Deliberately narrow: only the tagged JSON form, and only when the run
+    /// produced no parsed calls at all. Anything looser would start inventing
+    /// tool calls out of a model that was merely talking about one.
+    static func recoverToolCalls(from text: String) -> [(name: String, arguments: String)] {
+        var found: [(name: String, arguments: String)] = []
+        var rest = Substring(text)
+        while let close = rest.range(of: "</tool_call>") {
+            // The *last* opening tag before this close: the template emits one
+            // and the model emits another, so the observed output had it twice
+            // and taking the first left an unparseable body.
+            let head = rest[rest.startIndex..<close.lowerBound]
+            guard let open = head.range(of: "<tool_call>", options: .backwards) else {
+                rest = rest[close.upperBound...]
+                continue
+            }
+            let body = rest[open.upperBound..<close.lowerBound]
+            rest = rest[close.upperBound...]
+            guard
+                let data = body.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .data(using: .utf8),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let name = object["name"] as? String
+            else { continue }
+            let arguments = object["arguments"] ?? [String: Any]()
+            // `withoutEscapingSlashes` for the same reason as the main encoder:
+            // a path argument otherwise ships as "src\/main.rs".
+            let encoded =
+                (try? JSONSerialization.data(
+                    withJSONObject: arguments, options: [.withoutEscapingSlashes]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            found.append((name, encoded))
+        }
+        return found
     }
 
     /// Tool arguments go out as a JSON string: that is what the OpenAI shape
