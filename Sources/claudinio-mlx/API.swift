@@ -244,6 +244,8 @@ struct ModelList: Encodable {
 /// text: there is one consumer, and it is ours.
 struct Stats: Encodable {
     let modelKey: String
+    /// Metal buffer bytes, not RSS — see `ModelHost.stats()`.
+    var memoryBytes: Int = 0
     let ctxSize: Int
     let ctxUsed: Int
     let tokensPerSecond: Double

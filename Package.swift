@@ -31,6 +31,11 @@ let package = Package(
             name: "claudinio-mlx",
             dependencies: [
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                // Multimodal checkpoints keep their language weights under
+                // `language_model.*`; loading one with the text-only factory
+                // finds nothing there and generates from uninitialized weights,
+                // which comes out as mojibake rather than as an error.
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 // Adapts swift-transformers' AutoTokenizer to MLX's protocol.
                 // Only the tokenizer half is used: weights are fetched by the

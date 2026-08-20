@@ -1,6 +1,8 @@
 import Foundation
 import MLXHuggingFace
 import MLXLLM
+import MLXVLM
+import MLX
 import MLXLMCommon
 import Tokenizers
 
@@ -69,15 +71,35 @@ final class ModelHost: Sendable {
     /// Weights come off disk: the Rust side downloads and verifies them against
     /// the Hub's own sha256, so this never reaches the network.
     static func load(directory: URL, alias: String, ctxSize: Int) async throws -> ModelHost {
-        let container = try await LLMModelFactory.shared.loadContainer(
-            from: directory,
-            using: #huggingFaceTokenizerLoader()
-        )
+        if let reason = ModelCompatibility.reasonToRefuse(directory: directory) {
+            throw ServerError.unsupportedModel(reason)
+        }
+        // A multimodal checkpoint keeps its language weights under
+        // `language_model.*`. The text-only factory looks for `model.*`, finds
+        // nothing, and generates from uninitialized weights — which reads as a
+        // broken app, not an unsupported model.
+        let container: ModelContainer
+        if ModelCompatibility.isMultimodal(directory: directory) {
+            container = try await VLMModelFactory.shared.loadContainer(
+                from: directory,
+                using: #huggingFaceTokenizerLoader()
+            )
+        } else {
+            container = try await LLMModelFactory.shared.loadContainer(
+                from: directory,
+                using: #huggingFaceTokenizerLoader()
+            )
+        }
         return ModelHost(container: container, alias: alias, ctxSize: ctxSize)
     }
 
     func stats() async -> Stats {
-        await counters.snapshot(alias: alias, ctxSize: ctxSize)
+        var stats = await counters.snapshot(alias: alias, ctxSize: ctxSize)
+        // Weights live in Metal buffers, which do not show up in the process's
+        // resident set: RSS reported ~80 MB for a model the OS was accounting
+        // 49 GB for. MLX knows what it allocated, so it says so.
+        stats.memoryBytes = GPU.snapshot().activeMemory
+        return stats
     }
 
     /// What one generation produced, in the order the model produced it.
@@ -180,11 +202,13 @@ final class ModelHost: Sendable {
 enum ServerError: Error, CustomStringConvertible {
     case notLoaded
     case badRequest(String)
+    case unsupportedModel(String)
 
     var description: String {
         switch self {
         case .notLoaded: return "the model is still loading"
         case .badRequest(let m): return m
+        case .unsupportedModel(let m): return m
         }
     }
 }
