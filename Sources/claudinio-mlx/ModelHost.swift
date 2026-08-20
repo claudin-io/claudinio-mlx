@@ -271,7 +271,16 @@ final class ModelHost: Sendable {
             /// Upstream's `prepare` for this family takes a `windowSize` and
             /// discards it — `MLXVLM/Models/Qwen35.swift` spells the parameter
             /// `windowSize _:` — so the whole prompt goes to the GPU as a
-            /// single graph. Measured on an M2 Max with Qwen3.6-35B-A3B, 23k
+            /// single graph.
+            ///
+            /// This is a backport, not an invention: upstream `main` has since
+            /// replaced `windowSize` with a `PrefillParameters` and chunks
+            /// through `prefill.forEachChunk(total:)`, evaluating between
+            /// windows. That work is unreleased — 3.31.4, which this package
+            /// pins, is still the newest tag — so until it ships the split has
+            /// to happen here. When it does, drop this and take theirs; the
+            /// `prepare` signature changes, so it is a migration rather than a
+            /// version bump. Measured on an M2 Max with Qwen3.6-35B-A3B, 23k
             /// tokens survive as one command buffer that runs for 106 seconds,
             /// and 30k does not: macOS kills it as `Impacting Interactivity`
             /// and MLX raises that as an uncaught C++ exception, which takes
