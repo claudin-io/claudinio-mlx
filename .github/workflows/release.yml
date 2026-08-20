@@ -1,0 +1,71 @@
+name: release
+
+# Publishes the notarizable binary the app downloads. Tag-driven so a release
+# is an explicit act: Claudinio Code pins this by version + sha256, the same
+# way it pins llama.cpp, so an accidental publish would not be picked up but a
+# surprise one would still sit in the release list.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.app
+
+      # SwiftPM on the command line cannot compile MLX's Metal shaders; on
+      # Xcode 26 the Metal compiler is a separately downloaded component, and
+      # without it the binary builds but dies at runtime with "Failed to load
+      # the default metallib".
+      - name: Download the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Test
+        run: swift test
+
+      - name: Build
+        run: |
+          xcodebuild build -scheme claudinio-mlx -destination 'platform=OS X' \
+            -configuration Release -derivedDataPath .xcbuild \
+            -skipPackagePluginValidation -skipMacroValidation
+
+      # The binary and the shader bundle are useless apart, so they ship as one
+      # archive with a flat layout the app can extract and run in place.
+      - name: Package
+        run: |
+          set -euo pipefail
+          products=.xcbuild/Build/Products/Release
+          test -f "$products/claudinio-mlx"
+          test -f "$products/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
+          staging=$(mktemp -d)
+          cp "$products/claudinio-mlx" "$staging/"
+          cp -R "$products/mlx-swift_Cmlx.bundle" "$staging/"
+          for bundle in "$products"/*.bundle; do
+            cp -R "$bundle" "$staging/" 2>/dev/null || true
+          done
+          tar -czf "claudinio-mlx-macos-arm64.tar.gz" -C "$staging" .
+          shasum -a 256 claudinio-mlx-macos-arm64.tar.gz | tee checksums.txt
+
+      - name: Smoke test the packaged binary
+        run: |
+          set -euo pipefail
+          unpacked=$(mktemp -d)
+          tar -xzf claudinio-mlx-macos-arm64.tar.gz -C "$unpacked"
+          # Exits 2 with usage — proves it loaded the Metal library and linked,
+          # which a `swift build` binary does not survive.
+          "$unpacked/claudinio-mlx" || test $? -eq 2
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            claudinio-mlx-macos-arm64.tar.gz
+            checksums.txt
