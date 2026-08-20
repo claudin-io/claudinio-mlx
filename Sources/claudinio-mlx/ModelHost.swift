@@ -110,6 +110,46 @@ final class ModelHost: Sendable {
         return stats
     }
 
+    /// How much prompt goes to the GPU at a time.
+    ///
+    /// Deliberately not `GenerateParameters.prefillStepSize` (512). That is
+    /// upstream's default for models whose prefill is one dense forward pass
+    /// per window; here 30 of this family's 40 layers are gated-delta, and
+    /// windows that small leave the GPU under-fed. Measured on an M2 Max with
+    /// Qwen3.6-35B-A3B-4bit, one prompt, time to first token:
+    ///
+    ///     window     30k tokens    46k tokens
+    ///        512        128.3s        233.6s
+    ///       2048         91.3s        160.7s
+    ///       4096         84.9s        153.1s
+    ///       8192         80.1s        172.2s
+    ///
+    /// 4096 is the compromise: within 6% of the best at 30k and the best at
+    /// 46k, where 8192 has begun losing to its own footprint. Larger windows
+    /// also walk back toward the single stalled command buffer this exists to
+    /// avoid.
+    static let prefillWindow = 4096
+
+    /// The windows a prefill of `range` is split into: `step` at a time, with
+    /// whatever is left over as the last one.
+    ///
+    /// Split out to be testable without a model on disk. The last window is
+    /// the one whose sampled token generation starts from, so a window that
+    /// came back empty, overlapping, or short of `range` would not crash — it
+    /// would answer from the wrong prompt.
+    static func prefillWindows(_ range: Range<Int>, step: Int) -> [Range<Int>] {
+        guard !range.isEmpty else { return [] }
+        let step = max(1, step)
+        var windows: [Range<Int>] = []
+        var start = range.lowerBound
+        while range.upperBound - start > step {
+            windows.append(start ..< start + step)
+            start += step
+        }
+        windows.append(start ..< range.upperBound)
+        return windows
+    }
+
     /// What one generation produced, in the order the model produced it.
     enum Event: Sendable {
         case chunk(String)
@@ -224,6 +264,44 @@ final class ModelHost: Sendable {
             }
             let reused = base
 
+            /// Read `range` into `cache`, a window at a time, and hand back the
+            /// iterator holding the last one — the token it sampled is the one
+            /// generation starts from.
+            ///
+            /// Upstream's `prepare` for this family takes a `windowSize` and
+            /// discards it — `MLXVLM/Models/Qwen35.swift` spells the parameter
+            /// `windowSize _:` — so the whole prompt goes to the GPU as a
+            /// single graph. Measured on an M2 Max with Qwen3.6-35B-A3B, 23k
+            /// tokens survive as one command buffer that runs for 106 seconds,
+            /// and 30k does not: macOS kills it as `Impacting Interactivity`
+            /// and MLX raises that as an uncaught C++ exception, which takes
+            /// the process down mid-answer. Chunking is what upstream already
+            /// does for every other multimodal family — Pixtral, FastVLM and
+            /// Idefics3 all evaluate between windows.
+            ///
+            /// Each window costs one discarded sample, which is one token of
+            /// work per `prefillStepSize` tokens of prompt.
+            func prefill(_ range: Range<Int>) throws -> TokenIterator {
+                var start = range.lowerBound
+                for window in Self.prefillWindows(range, step: Self.prefillWindow)
+                    .dropLast()
+                {
+                    _ = try TokenIterator(
+                        input: slice(window), model: context.model,
+                        cache: cache, parameters: parameters)
+                    // Force this window out before building the next, so what
+                    // reaches the GPU is a series of command buffers rather
+                    // than one the watchdog will not sit through. Evaluating
+                    // the cache is what draws the boundary: the window's whole
+                    // forward pass is upstream of it.
+                    eval(cache.flatMap { $0.innerState() })
+                    start = window.upperBound
+                }
+                return try TokenIterator(
+                    input: slice(start ..< range.upperBound), model: context.model,
+                    cache: cache, parameters: parameters)
+            }
+
             // Snapshot the cache partway through the prefill, at the boundary
             // this prompt and the previous one still agree on. Splitting the
             // prefill in two costs one extra sampling step at the seam and
@@ -231,17 +309,13 @@ final class ModelHost: Sendable {
             // whole point, since by the time generation is done the cache has
             // run past any boundary a later prompt will still match.
             if let pinAt = self.prefix.pinLength(for: promptTokens, startingAt: base) {
-                _ = try TokenIterator(
-                    input: slice(base ..< pinAt), model: context.model,
-                    cache: cache, parameters: parameters)
+                _ = try prefill(base ..< pinAt)
                 self.prefix.pin(
                     tokens: Array(promptTokens[0 ..< pinAt]), cache: cache)
                 base = pinAt
             }
 
-            var iterator = try TokenIterator(
-                input: slice(base ..< promptTokens.count), model: context.model,
-                cache: cache, parameters: parameters)
+            var iterator = try prefill(base ..< promptTokens.count)
 
             let stopTokenIds = Self.stopTokenIds(
                 configuration: context.configuration,
