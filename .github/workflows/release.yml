@@ -14,12 +14,23 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    # mlx-swift-lm declares swift-tools-version 6.2, so the runner has to carry
+    # Xcode 26 or newer; macos-15 images ship Swift 6.1 and cannot resolve it.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_26.app
+      # Pick the newest Xcode the image actually has rather than a pinned path:
+      # the runner images rename and rotate these, and a missing path fails
+      # before anything useful has been attempted.
+      - name: Select the newest Xcode
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          newest=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$newest"
+          xcodebuild -version
+          swift --version
 
       # SwiftPM on the command line cannot compile MLX's Metal shaders; on
       # Xcode 26 the Metal compiler is a separately downloaded component, and
